@@ -14,6 +14,11 @@ from .scheduler import get_zone
 # ---------------------------------------------------------------------------
 
 
+def parse_hhmm(value: str, field_name: str = "time") -> time:
+    """Parse an ``HH:MM`` (or ``HH:MM:SS``) wall-clock time or raise 422."""
+    return _parse_hhmm(value, field_name)
+
+
 def _parse_hhmm(value: str, field_name: str) -> time:
     for fmt in ("%H:%M", "%H:%M:%S"):
         try:
@@ -282,6 +287,28 @@ class TripPlanIn(BaseModel):
                 "(e.g. 2026-10-02T00:00:00+08:00)"
             )
         return value
+
+
+class RecurringReservationCreateIn(BaseModel):
+    """Recurring weekly reservation (连续周循环预约) request.
+
+    The visitor names one recycling point in the path and books the same
+    local wall-clock slot for ``weeks`` (2..4) consecutive weeks, starting on
+    ``first_date`` (a local date at that point).  ``end_time`` at or before
+    ``start_time`` means the visit ends on the next local day.  The wall-clock
+    times are parsed and semantically validated outside the model so format
+    errors keep the distinguishable ``invalid_period`` code.
+    """
+
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    first_date: date
+    start_time: str = Field(min_length=1, max_length=8)
+    end_time: str = Field(min_length=1, max_length=8)
+    weeks: int = Field(
+        ge=2,
+        le=4,
+        description="Number of consecutive weeks booked as one group (2..4).",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -623,3 +650,41 @@ class TripPlanOut(BaseModel):
     search_to: str
     min_gap_minutes: int
     stops: list[TripPlanStopOut]
+
+
+class RecurringVisitOut(BaseModel):
+    """One weekly visit of a booked recurring plan, in week order.
+
+    The visit is an ordinary reservation: ``reservation`` carries its
+    number, immutable cancel token, first-creation rules version and current
+    status, so every week can independently be cancelled, rescheduled,
+    reassigned, checked in and checked out through the existing endpoints.
+    ``start`` / ``end`` are the DST-resolved UTC window used for this week.
+    """
+
+    week: int
+    local_date: date
+    start: str
+    end: str
+    rules_version: int
+    reservation: ReservationOut
+
+
+class RecurringReservationOut(BaseModel):
+    """Result of an atomic recurring weekly reservation (连续周循环预约).
+
+    ``visits`` is always in week order (week 1 on ``first_date``); each entry
+    is an independently manageable ordinary reservation.  A same-content
+    idempotent retry replays the first-creation windows of every week while
+    each reservation's status reflects its current live state.
+    """
+
+    plan_id: int
+    point_id: int
+    idempotency_key: str
+    first_date: date
+    start_time: str
+    end_time: str
+    weeks: int
+    created_at: datetime
+    visits: list[RecurringVisitOut]

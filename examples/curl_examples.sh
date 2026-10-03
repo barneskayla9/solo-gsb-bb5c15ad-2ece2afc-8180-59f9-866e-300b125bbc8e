@@ -745,3 +745,107 @@ api POST "/points/$CPID/reservations/$CRID/reschedule" "{
 # records checked_out_at, releases the rest of the window from that instant
 # and promotes the waitlist in the same transaction; a repeat checkout
 # replays the first record, and a wrong token is always refused (403).
+
+# ==========================================================================
+# Recurring weekly reservations (连续周循环预约)
+# Same recycling point, same local wall-clock slot, 2..4 consecutive weeks.
+# Input is local date + wall clock at the point (end <= start => next-day
+# end); the service converts every week to UTC with DST rules.  All weeks
+# must pass the ordinary single-reservation rules or the whole group books
+# nothing; each booked week is an ordinary reservation with its own token.
+# ==========================================================================
+
+echo
+echo "== 11. Recurring weekly reservations (2..4 consecutive weeks, one group) =="
+RPID="$(api POST /points '{"name":"固定时段循环访客点","timezone":"UTC"}' \
+  | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+echo "recurring point id = $RPID"
+
+# Open every day 00:00-23:59 so every weekly visit is covered.
+RULES_JSON='{"weekly":['
+for W in 1 2 3 4 5 6 7; do
+  RULES_JSON="$RULES_JSON{\"weekday\":$W,\"start_time\":\"00:00\",\"end_time\":\"23:59\"},"
+done
+RULES_JSON="${RULES_JSON%,}],\"closed_dates\":[],\"makeup\":[]}"
+api POST "/points/$RPID/rules" "{\"expected_version\":0,\"rules\":$RULES_JSON}" >/dev/null
+
+# First local date 3 days from now (must be inside the 30-day booking horizon).
+RDATE="$(date -u -d '+3 days' +%Y-%m-%d 2>/dev/null || date -u -v+3d +%Y-%m-%d)"
+
+echo
+echo "-- book 09:00-10:00 local on $RDATE and the next two same-weekdays (201) --"
+PLAN_JSON="$(api POST "/points/$RPID/recurring-reservations" "{
+  \"idempotency_key\": \"recurring-demo-1\",
+  \"first_date\": \"$RDATE\",
+  \"start_time\": \"09:00\",
+  \"end_time\": \"10:00\",
+  \"weeks\": 3
+}")"
+echo "$PLAN_JSON"
+PLAN_ID="$(echo "$PLAN_JSON" | sed -n 's/.*"plan_id":\([0-9]*\).*/\1/p')"
+echo "plan id = $PLAN_ID; each visits[].reservation is a normal reservation"
+# Pull week 2 (array index 1) reservation id + cancel token with python3 (no jq dep).
+W2_RID="$(printf '%s' "$PLAN_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["visits"][1]["reservation"]["id"])')"
+W2_TOKEN="$(printf '%s' "$PLAN_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["visits"][1]["reservation"]["cancel_token"])')"
+
+echo
+echo "-- same point + same key + same content replays the group (200) --"
+api POST "/points/$RPID/recurring-reservations" "{
+  \"idempotency_key\": \"recurring-demo-1\",
+  \"first_date\": \"$RDATE\",
+  \"start_time\": \"09:00\",
+  \"end_time\": \"10:00\",
+  \"weeks\": 3
+}"
+
+echo
+echo "-- same key + different content conflicts (409 idempotency_conflict) --"
+api POST "/points/$RPID/recurring-reservations" "{
+  \"idempotency_key\": \"recurring-demo-1\",
+  \"first_date\": \"$RDATE\",
+  \"start_time\": \"11:00\",
+  \"end_time\": \"12:00\",
+  \"weeks\": 3
+}"
+
+echo
+echo "-- every week is a normal reservation: cancel week 2 with its own token --"
+api POST "/points/$RPID/reservations/$W2_RID/cancel" "{\"cancel_token\":\"$W2_TOKEN\"}"
+
+echo
+echo "-- replay keeps first-created windows; week 2 status is now cancelled --"
+api POST "/points/$RPID/recurring-reservations" "{
+  \"idempotency_key\": \"recurring-demo-1\",
+  \"first_date\": \"$RDATE\",
+  \"start_time\": \"09:00\",
+  \"end_time\": \"10:00\",
+  \"weeks\": 3
+}" | python3 -c 'import json,sys; p=json.load(sys.stdin); print("plan", p["plan_id"], "statuses:", [v["reservation"]["status"] for v in p["visits"]])'
+
+echo
+echo "-- overnight slot (end <= start => next-day end) on a 20:00-02:00 point --"
+ONPID="$(api POST /points '{"name":"夜间循环访客点","timezone":"UTC"}' \
+  | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+ON_RULES='{"weekly":['
+for W in 1 2 3 4 5 6 7; do
+  ON_RULES="$ON_RULES{\"weekday\":$W,\"start_time\":\"20:00\",\"end_time\":\"02:00\"},"
+done
+ON_RULES="${ON_RULES%,}],\"closed_dates\":[],\"makeup\":[]}"
+api POST "/points/$ONPID/rules" "{\"expected_version\":0,\"rules\":$ON_RULES}" >/dev/null
+api POST "/points/$ONPID/recurring-reservations" "{
+  \"idempotency_key\": \"recurring-demo-overnight\",
+  \"first_date\": \"$RDATE\",
+  \"start_time\": \"23:00\",
+  \"end_time\": \"01:00\",
+  \"weeks\": 2
+}"
+
+echo
+echo "-- weeks outside 2..4 is a shape error (422 invalid_request) --"
+api POST "/points/$RPID/recurring-reservations" "{
+  \"idempotency_key\": \"recurring-demo-bad\",
+  \"first_date\": \"$RDATE\",
+  \"start_time\": \"09:00\",
+  \"end_time\": \"10:00\",
+  \"weeks\": 5
+}"

@@ -933,6 +933,79 @@ def main() -> None:
     # promotes the waitlist in the same transaction; a repeat checkout
     # replays the first record and a wrong token is always refused.
 
+    # ------------------------------------------------------------------
+    # Recurring weekly reservations (连续周循环预约): same point, same local
+    # slot, 2..4 consecutive weeks, booked as one atomic group.
+    # ------------------------------------------------------------------
+    status, rec_point = call(
+        "POST", "/points", {"name": "固定时段循环访客点", "timezone": "UTC"}
+    )
+    show("create point for recurring visits", status, rec_point)
+    rcid = rec_point["id"]
+    status, _ = call(
+        "POST",
+        f"/points/{rcid}/rules",
+        {
+            "expected_version": 0,
+            "rules": {
+                "weekly": [
+                    {"weekday": w, "start_time": "00:00", "end_time": "23:59"}
+                    for w in range(1, 8)
+                ],
+                "closed_dates": [],
+                "makeup": [],
+            },
+        },
+    )
+
+    first_day = (datetime.now(timezone.utc) + timedelta(days=3)).date()
+    recurring_body = {
+        "idempotency_key": "recurring-demo-1",
+        "first_date": first_day.isoformat(),
+        "start_time": "09:00",          # local wall clock at the point
+        "end_time": "10:00",            # end <= start would mean next-day end
+        "weeks": 3,                     # 2..4 consecutive weeks
+    }
+    status, plan = call(
+        "POST", f"/points/{rcid}/recurring-reservations", recurring_body
+    )
+    show("book the same slot for 3 consecutive weeks (201, atomic group)", status, plan)
+
+    # Same point + same key + same content replays the first-created weekly
+    # windows and tokens (HTTP 200); each reservation's status is live.
+    status, replay = call(
+        "POST", f"/points/{rcid}/recurring-reservations", recurring_body
+    )
+    show("same key + same content replays the group (200)", status, replay)
+
+    # Same key + different content conflicts (nothing is changed).
+    different = {**recurring_body, "weeks": 2}
+    status, conflict = call(
+        "POST", f"/points/{rcid}/recurring-reservations", different
+    )
+    show("same key + different content -> 409 idempotency_conflict", status, conflict)
+
+    # Every week is an ordinary reservation: cancel week 2 on its own.
+    week2 = plan["visits"][1]
+    status, cancelled = call(
+        "POST",
+        f"/points/{rcid}/reservations/{week2['reservation']['id']}/cancel",
+        {"cancel_token": week2["reservation"]["cancel_token"]},
+    )
+    show("week 2 cancelled independently with its own token", status, cancelled)
+    status, after = call(
+        "POST", f"/points/{rcid}/recurring-reservations", recurring_body
+    )
+    show(
+        "replay keeps first-created windows but reflects live statuses "
+        "(week 2 = cancelled)",
+        status,
+        {
+            "plan_id": after["plan_id"],
+            "statuses": [v["reservation"]["status"] for v in after["visits"]],
+        },
+    )
+
 
 if __name__ == "__main__":
     main()

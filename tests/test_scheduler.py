@@ -15,6 +15,7 @@ from app.scheduler import (
     get_zone,
     resolve_end,
     resolve_start,
+    weekly_windows,
 )
 
 T = lambda h, m=0: time(h, m)  # noqa: E731
@@ -421,3 +422,81 @@ def test_open_intervals_separate_sessions_stay_separate():
         (utc(2026, 10, 7, 8), utc(2026, 10, 7, 10)),
         (utc(2026, 10, 7, 12), utc(2026, 10, 7, 14)),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Recurring weekly series resolution (连续周循环预约 wall-clock -> UTC)
+# ---------------------------------------------------------------------------
+
+def test_weekly_windows_same_slot_every_week_no_dst():
+    # Asia/Shanghai has no DST: the UTC offset is identical every week.
+    windows = weekly_windows(
+        "Asia/Shanghai", date(2026, 10, 6), T(9), T(10), 3
+    )  # 2026-10-06 is a Tuesday
+    assert [d for d, _s, _e in windows] == [
+        date(2026, 10, 6),
+        date(2026, 10, 13),
+        date(2026, 10, 20),
+    ]
+    assert all((e - s) == timedelta(hours=1) for _d, s, e in windows)
+    # 09:00 +08 = 01:00Z every week.
+    assert [u(s) for _d, s, _e in windows] == [
+        utc(2026, 10, 6, 1),
+        utc(2026, 10, 13, 1),
+        utc(2026, 10, 20, 1),
+    ]
+
+
+def test_weekly_windows_end_not_after_start_means_next_day_end():
+    # 20:00 -> 02:00 spans into the following local day.
+    windows = weekly_windows(
+        "UTC", date(2026, 10, 2), T(20), T(2), 2
+    )  # Friday
+    assert [(d, u(s), u(e)) for d, s, e in windows] == [
+        (date(2026, 10, 2), utc(2026, 10, 2, 20), utc(2026, 10, 3, 2)),
+        (date(2026, 10, 9), utc(2026, 10, 9, 20), utc(2026, 10, 10, 2)),
+    ]
+
+
+def test_weekly_windows_spring_forward_week_gap_boundary_moves_forward():
+    # New York 2026-03-08 jumps 02:00 -> 03:00.  A Sunday 02:30-03:30 slot:
+    # the gap week's start moves to the first valid instant (03:00 EDT),
+    # shortening that week's UTC duration; the other weeks keep their wall
+    # clock slot (EST/EDT offsets before/after the change).
+    windows = weekly_windows(
+        "America/New_York", date(2026, 3, 1), T(2, 30), T(3, 30), 3
+    )
+    by_day = {d: (u(s), u(e)) for d, s, e in windows}
+    # Week 1: 2026-03-01 EST (-05) -> 07:30Z .. 08:30Z, one hour.
+    assert by_day[date(2026, 3, 1)] == (
+        utc(2026, 3, 1, 7, 30),
+        utc(2026, 3, 1, 8, 30),
+    )
+    # Week 2: 2026-03-08, 02:30 does not exist -> start moves to 03:00 EDT,
+    # end 03:30 EDT: 07:00Z .. 07:30Z, only 30 minutes.
+    assert by_day[date(2026, 3, 8)] == (
+        utc(2026, 3, 8, 7),
+        utc(2026, 3, 8, 7, 30),
+    )
+    # Week 3: 2026-03-15 EDT (-04): 06:30Z .. 07:30Z, one hour again.
+    assert by_day[date(2026, 3, 15)] == (
+        utc(2026, 3, 15, 6, 30),
+        utc(2026, 3, 15, 7, 30),
+    )
+
+
+def test_weekly_windows_fall_back_week_start_early_end_late():
+    # New York 2026-11-01 repeats 01:00.  A Sunday 01:30 -> same 01:30 wall
+    # clock cannot mean a zero-length end (end <= start is next-day), so use
+    # a same-day 00:30-01:30 slot: the fall-back week's end takes the later
+    # 01:30 (EST), giving a 2-hour UTC span while the other weeks last one.
+    windows = weekly_windows(
+        "America/New_York", date(2026, 10, 25), T(0, 30), T(1, 30), 3
+    )
+    durations = {d: (e - s) for d, s, e in windows}
+    assert durations[date(2026, 10, 25)] == timedelta(hours=1)  # EDT
+    assert durations[date(2026, 11, 1)] == timedelta(hours=2)  # repeated hour
+    assert durations[date(2026, 11, 8)] == timedelta(hours=1)  # EST
+    gap_start, gap_end = windows[1][1], windows[1][2]
+    assert u(gap_start) == utc(2026, 11, 1, 4, 30)  # earlier 01:30 EDT
+    assert u(gap_end) == utc(2026, 11, 1, 6, 30)  # later 01:30 EST

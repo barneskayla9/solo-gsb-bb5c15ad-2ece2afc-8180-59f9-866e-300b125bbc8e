@@ -46,6 +46,9 @@ from .schemas import (
     PublishOut,
     PublishRulesIn,
     ReassignOut,
+    RecurringReservationCreateIn,
+    RecurringReservationOut,
+    RecurringVisitOut,
     ReservationAttendanceOut,
     ReservationCancelIn,
     ReservationCheckinIn,
@@ -66,12 +69,13 @@ from .schemas import (
     WaitlistCreateIn,
     WaitlistOut,
     WaitlistTokenIn,
+    parse_hhmm,
     utc_iso,
     validate_reservation_window,
     validate_rules_payload,
     validate_timezone,
 )
-from .scheduler import build_calendar, build_open_intervals, get_zone
+from .scheduler import build_calendar, build_open_intervals, get_zone, weekly_windows
 from .planner import StopSpec, plan_itinerary
 from .db import payload_to_ruleset
 
@@ -1953,3 +1957,239 @@ def plan_trip(body: TripPlanIn) -> TripPlanOut:
             for item in (planned or [])
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# Recurring weekly reservations (连续周循环预约) — same slot, 2..4 weeks
+# ---------------------------------------------------------------------------
+
+
+def _clock_hhmm(value) -> str:
+    """Render a stored wall-clock time back as ``HH:MM``."""
+    return value.strftime("%H:%M")
+
+
+def _recurring_plan_out(cur, plan: dict, week_rows: list[dict]) -> RecurringReservationOut:
+    """First-creation snapshot of a booked recurring plan.
+
+    Every weekly visit reports its reservation as first created (original
+    window, rules version and revision 1) while the status fields reflect the
+    live reservation row — same replay semantics as single reservations and
+    trips, so a week later rescheduled or cancelled still shows the original
+    group content alongside its current status.
+    """
+    visits = []
+    for week in week_rows:
+        reservation = db.get_reservation_by_id(cur, week["reservation_id"])
+        visits.append(
+            RecurringVisitOut(
+                week=week["week_number"],
+                local_date=week["local_date"],
+                start=utc_iso(week["start_utc"]),
+                end=utc_iso(week["end_utc"]),
+                rules_version=week["rules_version"],
+                reservation=_creation_replay_out(reservation),
+            )
+        )
+    return RecurringReservationOut(
+        plan_id=plan["id"],
+        point_id=plan["point_id"],
+        idempotency_key=plan["idempotency_key"],
+        first_date=plan["first_local_date"],
+        start_time=_clock_hhmm(plan["start_clock"]),
+        end_time=_clock_hhmm(plan["end_clock"]),
+        weeks=plan["weeks"],
+        created_at=plan["created_at"],
+        visits=visits,
+    )
+
+
+def _week_scoped(
+    error: ApiError, week_number: int, local_date, point_id: int
+) -> ApiError:
+    """Re-raise a per-week validation failure tagged with the failing week.
+
+    The original error type (HTTP status, code) and message are preserved;
+    ``week`` (1-based position in the consecutive series) and ``local_date``
+    name the week that broke the group, so nothing is booked and the caller
+    knows which week to fix.
+    """
+    details = {
+        "week": week_number,
+        "local_date": local_date.isoformat(),
+        "point_id": point_id,
+        **error.details,
+    }
+    return type(error)(
+        f"recurring reservation week {week_number} ({local_date.isoformat()}, "
+        f"point {point_id}): {error.message}",
+        details=details,
+    )
+
+
+@app.post(
+    "/points/{point_id}/recurring-reservations",
+    response_model=RecurringReservationOut,
+    status_code=201,
+    tags=["recurring"],
+)
+def create_recurring_reservation(
+    point_id: int, body: RecurringReservationCreateIn, response: Response
+) -> RecurringReservationOut:
+    """Book one point's same local slot for 2..4 consecutive weeks atomically.
+
+    The input is one local date (at the point), two wall-clock times and the
+    number of weeks; an ``end_time`` at or before ``start_time`` means the
+    visit ends on the next local day.  Each week is converted to UTC in the
+    point's timezone with the calendar's DST rules (spring-forward gaps move
+    to the first valid instant; fall-back repeats take the early start / late
+    end) and must pass the ordinary single-reservation rules — lead time, max
+    duration, one continuous open interval of the currently published
+    calendar, spare capacity over the half-open window.  Any week failing
+    aborts the whole group (nothing is booked); the failure keeps its
+    original error code and names the offending week.  Same point + same key
+    + same content replays the first-created group (HTTP 200, live statuses);
+    different content conflicts; a failure never consumes the key.
+    """
+    # Wall-clock times are parsed outside the pydantic model so bad formats
+    # keep the distinguishable invalid_period code (same as rule publishing).
+    start_clock = parse_hhmm(body.start_time, "start_time")
+    end_clock = parse_hhmm(body.end_time, "end_time")
+
+    now = datetime.now(timezone.utc)
+    with db.conn() as connection:
+        with connection.transaction():
+            cur = connection.cursor()
+            # The point row lock serializes the whole group against ordinary
+            # bookings, locks, trips, cancels, rule publishes and waitlist
+            # promotions for this point — same single-lock order every other
+            # capacity decision uses.
+            point = db.lock_point(cur, point_id)
+
+            # Idempotency scope is (point, key), independent of ordinary
+            # reservation / waitlist / lock / trip keys.  A same-content
+            # retry replays the first-created weekly windows and tokens while
+            # each week's status reflects its current state; different content
+            # conflicts.  Replay wins over validation (like trips), so a
+            # group booked weeks ago still replays after its horizon passes.
+            existing = db.get_recurring_plan_by_key(cur, point_id, body.idempotency_key)
+            if existing is not None:
+                if (
+                    existing["first_local_date"] == body.first_date
+                    and existing["start_clock"] == start_clock
+                    and existing["end_clock"] == end_clock
+                    and existing["weeks"] == body.weeks
+                ):
+                    response.status_code = 200
+                    stored_weeks = db.get_recurring_plan_weeks(cur, existing["id"])
+                    return _recurring_plan_out(cur, existing, stored_weeks)
+                raise IdempotencyConflictError(
+                    f"recurring reservation idempotency key "
+                    f"{body.idempotency_key!r} was already used on point "
+                    f"{point_id} with different recurring content",
+                    details={
+                        "plan_id": existing["id"],
+                        "first_date": existing["first_local_date"].isoformat(),
+                        "start_time": _clock_hhmm(existing["start_clock"]),
+                        "end_time": _clock_hhmm(existing["end_clock"]),
+                        "weeks": existing["weeks"],
+                    },
+                )
+
+            # Resolve every week's wall-clock slot to UTC with the calendar's
+            # DST rules before any capacity-touching work.
+            windows = weekly_windows(
+                point["timezone"],
+                body.first_date,
+                start_clock,
+                end_clock,
+                body.weeks,
+            )
+
+            # Capacity-touching write: expire due locks first and promote the
+            # waitlist into the freed slots, in application order.
+            _sweep_expired_locks(cur, point, now)
+
+            # Every week is validated against the *currently* published
+            # calendar; one interval expansion covers the whole series.
+            _, rules_row = db.get_current_rules(cur, point_id)
+            ruleset = payload_to_ruleset(rules_row["payload"])
+            intervals = build_open_intervals(
+                point["timezone"],
+                ruleset,
+                body.first_date - timedelta(days=1),
+                windows[-1][0] + timedelta(days=1),
+            )
+
+            plan: list[tuple] = []
+            for week_number, (local_day, start, end) in enumerate(windows, start=1):
+                try:
+                    # Existing single-reservation policy: future start, within
+                    # the bookable horizon, strictly positive length and no
+                    # longer than the per-reservation maximum.
+                    validate_reservation_window(
+                        start,
+                        end,
+                        now,
+                        max_days_ahead=settings.reservation_max_days_ahead,
+                        max_duration=timedelta(
+                            minutes=settings.reservation_max_duration_minutes
+                        ),
+                    )
+                    if not any(s <= start and end <= e for s, e in intervals):
+                        raise OutsideOpenHoursError(
+                            "recurring weekly visit is not fully contained in "
+                            "one continuous open interval of the published "
+                            "calendar",
+                            details={
+                                "start": utc_iso(start),
+                                "end": utc_iso(end),
+                                "rules_version": rules_row["version"],
+                            },
+                        )
+                    # The weekly slots are 7 days apart and each lasts no
+                    # longer than the reservation maximum, so they can never
+                    # overlap each other: per-week capacity probes against the
+                    # pre-insertion occupancy are equivalent to one group probe.
+                    _assert_window_has_capacity(cur, point, start, end, now=now)
+                except ApiError as exc:
+                    raise _week_scoped(exc, week_number, local_day, point_id)
+                plan.append((week_number, local_day, start, end))
+
+            # Every week validated: book the plan header and all ordinary
+            # reservations in this one transaction.  Any failure above rolled
+            # the whole group back and consumed neither slots nor the key.
+            saved_plan = db.insert_recurring_plan(
+                cur,
+                point_id=point_id,
+                idempotency_key=body.idempotency_key,
+                first_local_date=body.first_date,
+                start_clock=start_clock,
+                end_clock=end_clock,
+                weeks=body.weeks,
+            )
+            week_rows = []
+            for week_number, local_day, start, end in plan:
+                reservation = db.insert_reservation(
+                    cur,
+                    point_id,
+                    f"__recurring__:{saved_plan['id']}:{week_number}:"
+                    f"{secrets.token_urlsafe(16)}",
+                    start,
+                    end,
+                    rules_row["version"],
+                )
+                week_rows.append(
+                    db.insert_recurring_plan_week(
+                        cur,
+                        plan_id=saved_plan["id"],
+                        point_id=point_id,
+                        week_number=week_number,
+                        local_date=local_day,
+                        reservation_id=reservation["id"],
+                        start_utc=start,
+                        end_utc=end,
+                        rules_version=rules_row["version"],
+                    )
+                )
+            return _recurring_plan_out(cur, saved_plan, week_rows)

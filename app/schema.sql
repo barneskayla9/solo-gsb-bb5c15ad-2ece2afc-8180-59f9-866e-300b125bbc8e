@@ -246,3 +246,49 @@ CREATE TABLE IF NOT EXISTS slot_locks (
 -- future) alongside active reservations; this partial index serves them.
 CREATE INDEX IF NOT EXISTS idx_slot_locks_point_locked
     ON slot_locks (point_id, start_utc) WHERE status = 'locked';
+
+-- Recurring weekly reservations (连续周循环预约).  A visitor books the same
+-- recycling point at the same local wall-clock slot for 2..4 consecutive
+-- weeks in one atomic group: every weekly window must pass the ordinary
+-- single-reservation rules (lead time, max duration, one continuous open
+-- interval of the currently published calendar, spare capacity), or the
+-- whole group books nothing.  (point_id, idempotency_key) is the idempotency
+-- scope with the same first-successful-request-wins semantics as ordinary
+-- reservations; the stored local-slot content is what retries are compared
+-- against, so a failed attempt (which rolls the row back) never consumes
+-- the key.  The weekly visits themselves are ordinary reservations.
+CREATE TABLE IF NOT EXISTS recurring_plans (
+    id               BIGSERIAL PRIMARY KEY,
+    point_id         BIGINT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+    idempotency_key  TEXT NOT NULL,
+    first_local_date DATE NOT NULL,           -- local date of week 1 at the point
+    start_clock      TIME NOT NULL,           -- local wall-clock slot start (HH:MM[:SS])
+    end_clock        TIME NOT NULL,           -- end; end <= start means next-day end
+    weeks            INTEGER NOT NULL CHECK (weeks BETWEEN 2 AND 4),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (point_id, idempotency_key)
+);
+
+-- One row per week of a successfully booked recurring plan, in week order
+-- (week_number is 1-based).  The resolved UTC window and the rules version
+-- validated against are stored so a retry can replay the first-creation
+-- snapshot of every week even after individual visits are rescheduled or
+-- cancelled.  The reservation is a regular one: it keeps its own cancel
+-- token and goes through the existing cancel / reschedule / reassign /
+-- check-in / check-out flows independently.
+CREATE TABLE IF NOT EXISTS recurring_plan_weeks (
+    id              BIGSERIAL PRIMARY KEY,
+    plan_id         BIGINT NOT NULL REFERENCES recurring_plans(id) ON DELETE CASCADE,
+    point_id        BIGINT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+    week_number     INTEGER NOT NULL,         -- 1-based position in the series
+    local_date      DATE NOT NULL,            -- local date of that week's visit
+    reservation_id  BIGINT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+    start_utc       TIMESTAMPTZ NOT NULL,     -- DST-resolved window (idempotency content)
+    end_utc         TIMESTAMPTZ NOT NULL,
+    rules_version   INTEGER NOT NULL,         -- published version validated against
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (plan_id, week_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_recurring_plan_weeks_reservation
+    ON recurring_plan_weeks (reservation_id);

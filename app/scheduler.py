@@ -344,3 +344,43 @@ def build_open_intervals(
     day_pieces = _collect_day_pieces(rules, zone, seed, date_to)
     all_pieces = [piece for pieces in day_pieces.values() for piece in pieces]
     return [(start, end) for start, end, _sources in _merge_pieces(all_pieces)]
+
+
+def weekly_windows(
+    tz_name: str,
+    first_day: date,
+    start_clock: time,
+    end_clock: time,
+    weeks: int,
+) -> list[tuple[date, datetime, datetime]]:
+    """Resolve a fixed-slot series of consecutive weeks to UTC instants.
+
+    The visitor names the *first* visit by its local date and two wall-clock
+    times (``start_clock`` / ``end_clock``) at the point named by
+    ``tz_name``; further visits fall on the same clock times exactly 7, 14, …
+    local days later.  ``end_clock <= start_clock`` means the visit ends on
+    the following local day.
+
+    Each boundary is resolved with the same DST rules as the calendar:
+    a non-existent wall-clock (spring-forward gap) moves to the first valid
+    instant, and a repeated wall-clock (fall-back) takes the earlier
+    occurrence for the start and the later occurrence for the end — so a
+    series crossing a DST change gets that week's UTC offset right without
+    the other weeks changing wall-clock slot.
+
+    Returns ``(local_date, start_utc, end_utc)`` per week in order.
+    """
+    if weeks < 1:
+        raise ValueError("weeks must be at least 1")
+    start_clock = start_clock.replace(tzinfo=None)
+    end_clock = end_clock.replace(tzinfo=None)
+    zone = get_zone(tz_name)
+    overnight = end_clock <= start_clock
+    windows: list[tuple[date, datetime, datetime]] = []
+    for index in range(weeks):
+        day = first_day + timedelta(weeks=index)
+        start = resolve_start(datetime.combine(day, start_clock), zone)
+        end_day = day + timedelta(days=1) if overnight else day
+        end = resolve_end(datetime.combine(end_day, end_clock), zone)
+        windows.append((day, start, end))
+    return windows

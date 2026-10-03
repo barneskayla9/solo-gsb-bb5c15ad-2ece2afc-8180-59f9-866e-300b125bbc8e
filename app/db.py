@@ -1220,3 +1220,96 @@ def insert_trip_stop(
             rules_version,
         ),
     ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Recurring weekly reservations (连续周循环预约) — same slot, 2..4 weeks
+# ---------------------------------------------------------------------------
+
+_RECURRING_PLAN_COLS = (
+    "id, point_id, idempotency_key, first_local_date, start_clock, end_clock, "
+    "weeks, created_at"
+)
+
+_RECURRING_WEEK_COLS = (
+    "id, plan_id, point_id, week_number, local_date, reservation_id, "
+    "start_utc, end_utc, rules_version, created_at"
+)
+
+
+def get_recurring_plan_by_key(
+    cur: psycopg.Cursor, point_id: int, idempotency_key: str
+) -> dict | None:
+    return cur.execute(
+        f"SELECT {_RECURRING_PLAN_COLS} FROM recurring_plans "
+        "WHERE point_id = %s AND idempotency_key = %s",
+        (point_id, idempotency_key),
+    ).fetchone()
+
+
+def get_recurring_plan_weeks(cur: psycopg.Cursor, plan_id: int) -> list[dict]:
+    """Weeks of one recurring plan, in ascending week order (1-based)."""
+    return cur.execute(
+        f"SELECT {_RECURRING_WEEK_COLS} FROM recurring_plan_weeks "
+        "WHERE plan_id = %s ORDER BY week_number",
+        (plan_id,),
+    ).fetchall()
+
+
+def insert_recurring_plan(
+    cur: psycopg.Cursor,
+    *,
+    point_id: int,
+    idempotency_key: str,
+    first_local_date: date,
+    start_clock,
+    end_clock,
+    weeks: int,
+) -> dict:
+    return cur.execute(
+        "INSERT INTO recurring_plans "
+        "(point_id, idempotency_key, first_local_date, start_clock, "
+        " end_clock, weeks) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
+        f"RETURNING {_RECURRING_PLAN_COLS}",
+        (
+            point_id,
+            idempotency_key,
+            first_local_date,
+            start_clock,
+            end_clock,
+            weeks,
+        ),
+    ).fetchone()
+
+
+def insert_recurring_plan_week(
+    cur: psycopg.Cursor,
+    *,
+    plan_id: int,
+    point_id: int,
+    week_number: int,
+    local_date: date,
+    reservation_id: int,
+    start_utc: datetime,
+    end_utc: datetime,
+    rules_version: int,
+) -> dict:
+    """Record one booked week of a recurring plan (same transaction as plan)."""
+    return cur.execute(
+        "INSERT INTO recurring_plan_weeks "
+        "(plan_id, point_id, week_number, local_date, reservation_id, "
+        " start_utc, end_utc, rules_version) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+        f"RETURNING {_RECURRING_WEEK_COLS}",
+        (
+            plan_id,
+            point_id,
+            week_number,
+            local_date,
+            reservation_id,
+            start_utc,
+            end_utc,
+            rules_version,
+        ),
+    ).fetchone()
