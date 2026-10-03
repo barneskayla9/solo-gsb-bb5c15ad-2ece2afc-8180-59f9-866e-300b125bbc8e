@@ -1220,3 +1220,101 @@ def insert_trip_stop(
             rules_version,
         ),
     ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Weekly recurring visit plans (连周预约) — one fixed local slot for 2..4 weeks
+# ---------------------------------------------------------------------------
+
+_WEEKLY_PLAN_COLS = (
+    "id, point_id, idempotency_key, first_local_date, start_time, end_time, "
+    "week_count, created_at"
+)
+
+_WEEKLY_PLAN_VISIT_COLS = (
+    "id, plan_id, point_id, week, reservation_id, start_utc, end_utc, "
+    "rules_version, created_at"
+)
+
+
+def insert_weekly_plan_key(
+    cur: psycopg.Cursor,
+    point_id: int,
+    idempotency_key: str,
+    first_local_date: date,
+    start_time: str,
+    end_time: str,
+    week_count: int,
+) -> dict | None:
+    """Claim a weekly-plan idempotency key inside the caller's transaction.
+
+    Mirrors :func:`insert_trip_key`: returns the new plan row, or None when
+    the key is already committed.  A request that fails validation rolls the
+    whole transaction (including this insert) back, so a failed plan never
+    consumes its key.
+    """
+    return cur.execute(
+        "INSERT INTO weekly_plans "
+        "(point_id, idempotency_key, first_local_date, start_time, end_time, "
+        " week_count) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (point_id, idempotency_key) DO NOTHING "
+        f"RETURNING {_WEEKLY_PLAN_COLS}",
+        (
+            point_id,
+            idempotency_key,
+            first_local_date,
+            start_time,
+            end_time,
+            week_count,
+        ),
+    ).fetchone()
+
+
+def get_weekly_plan_by_key(
+    cur: psycopg.Cursor, point_id: int, idempotency_key: str
+) -> dict | None:
+    return cur.execute(
+        f"SELECT {_WEEKLY_PLAN_COLS} FROM weekly_plans "
+        "WHERE point_id = %s AND idempotency_key = %s",
+        (point_id, idempotency_key),
+    ).fetchone()
+
+
+def get_weekly_plan_visits(cur: psycopg.Cursor, plan_id: int) -> list[dict]:
+    """Booked weeks of one plan in 1-based week order."""
+    return cur.execute(
+        f"SELECT {_WEEKLY_PLAN_VISIT_COLS} FROM weekly_plan_visits "
+        "WHERE plan_id = %s ORDER BY week",
+        (plan_id,),
+    ).fetchall()
+
+
+def insert_weekly_plan_visit(
+    cur: psycopg.Cursor,
+    *,
+    plan_id: int,
+    point_id: int,
+    week: int,
+    reservation_id: int,
+    start_utc: datetime,
+    end_utc: datetime,
+    rules_version: int,
+) -> dict:
+    """Record one booked week of a plan (same transaction as the plan row)."""
+    return cur.execute(
+        "INSERT INTO weekly_plan_visits "
+        "(plan_id, point_id, week, reservation_id, start_utc, end_utc, "
+        " rules_version) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+        f"RETURNING {_WEEKLY_PLAN_VISIT_COLS}",
+        (
+            plan_id,
+            point_id,
+            week,
+            reservation_id,
+            start_utc,
+            end_utc,
+            rules_version,
+        ),
+    ).fetchone()

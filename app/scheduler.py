@@ -295,6 +295,36 @@ def _collect_day_pieces(
     return day_pieces
 
 
+def resolve_weekly_visit_windows(
+    tz_name: str,
+    first_local_day: date,
+    start_time: time,
+    end_time: time,
+    week_count: int,
+) -> list[tuple[datetime, datetime]]:
+    """Locate a fixed wall-clock weekly slot over consecutive weeks.
+
+    Week 1 visits on ``first_local_day``, week 2 seven days later, and so on.
+    Each visit is resolved in ``tz_name`` with the same DST semantics as the
+    calendar engine: a non-existent ("spring forward") boundary moves forward
+    to the first valid instant (``resolve_start``/``resolve_end``), while a
+    repeated ("fall back") boundary takes the earlier instance for the start
+    and the later instance for the end.  ``end_time <= start_time`` means the
+    visit ends the next day; the week offset always counts by *local* date,
+    so every week visits the same local weekday regardless of DST shifts.
+    """
+    zone = get_zone(tz_name)
+    overnight = end_time <= start_time
+    windows: list[tuple[datetime, datetime]] = []
+    for week in range(week_count):
+        local_day = first_local_day + timedelta(weeks=week)
+        start = resolve_start(datetime.combine(local_day, start_time), zone)
+        end_day = local_day + timedelta(days=1) if overnight else local_day
+        end = resolve_end(datetime.combine(end_day, end_time), zone)
+        windows.append((start, end))
+    return windows
+
+
 def build_calendar(
     tz_name: str,
     rules: RuleSet,

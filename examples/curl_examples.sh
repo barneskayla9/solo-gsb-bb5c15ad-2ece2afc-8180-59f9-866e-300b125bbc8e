@@ -745,3 +745,88 @@ api POST "/points/$CPID/reservations/$CRID/reschedule" "{
 # records checked_out_at, releases the rest of the window from that instant
 # and promotes the waitlist in the same transaction; a repeat checkout
 # replays the first record, and a wrong token is always refused (403).
+
+echo
+echo "== 14. Weekly recurring plans (连周预约): one fixed local slot, 2..4 weeks =="
+# A fresh point open 08:00-18:00 every day, so all upcoming weeks are covered.
+WPOINT_JSON="$(api POST /points '{"name":"连周演示点","timezone":"Asia/Shanghai","capacity":3}')"
+WPID="$(echo "$WPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+WWEEKLY=""
+for DOW in 1 2 3 4 5 6 7; do
+  WWEEKLY="${WWEEKLY}{\"weekday\":$DOW,\"start_time\":\"08:00\",\"end_time\":\"18:00\"},"
+done
+api POST "/points/$WPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {\"weekly\": [${WWEEKLY%,}], \"closed_dates\": [], \"makeup\": []}
+}"
+
+echo
+echo "-- book local 09:00-10:00 for 3 consecutive weeks starting next Monday --"
+# Next Monday in the point's local calendar (Asia/Shanghai == UTC+8 here, no DST).
+FIRST_MON="$(TZ=Asia/Shanghai date -d 'next monday' +%F 2>/dev/null || date -u -v+mon +%F)"
+PLAN_JSON="$(api POST "/points/$WPID/weekly-plans" "{
+  \"idempotency_key\": \"weekly-demo-1\",
+  \"first_local_date\": \"$FIRST_MON\",
+  \"start_time\": \"09:00\",
+  \"end_time\": \"10:00\",
+  \"week_count\": 3
+}")"
+echo "$PLAN_JSON"
+# -> 201: weekly_plan_id + weeks[] in order; each week is an ordinary
+#    reservation (id, cancel_token, UTC start/end; Shanghai 09:00 = 01:00Z).
+
+echo
+echo "-- same point + same key + same content replays the first plan (HTTP 200) --"
+api POST "/points/$WPID/weekly-plans" "{
+  \"idempotency_key\": \"weekly-demo-1\",
+  \"first_local_date\": \"$FIRST_MON\",
+  \"start_time\": \"09:00\",
+  \"end_time\": \"10:00\",
+  \"week_count\": 3
+}"
+
+echo
+echo "-- same key, different slot -> 409 idempotency_conflict --"
+api POST "/points/$WPID/weekly-plans" "{
+  \"idempotency_key\": \"weekly-demo-1\",
+  \"first_local_date\": \"$FIRST_MON\",
+  \"start_time\": \"11:00\",
+  \"end_time\": \"12:00\",
+  \"week_count\": 3
+}"
+
+echo
+echo "-- overnight slot (end <= start means next-day end): 22:00 -> 00:30 --"
+api POST "/points/$WPID/weekly-plans" "{
+  \"idempotency_key\": \"weekly-demo-overnight\",
+  \"first_local_date\": \"$FIRST_MON\",
+  \"start_time\": \"22:00\",
+  \"end_time\": \"00:30\",
+  \"week_count\": 2
+}"
+
+echo
+echo "-- all-or-nothing: any invalid week books nothing; failed weeks listed --"
+# A 15:00-18:30 visit exceeds the 120-minute max on EVERY week: 422 with
+# details.failed_weeks naming each week ordinal, its UTC window and reason.
+api POST "/points/$WPID/weekly-plans" "{
+  \"idempotency_key\": \"weekly-demo-bad\",
+  \"first_local_date\": \"$FIRST_MON\",
+  \"start_time\": \"15:00\",
+  \"end_time\": \"18:30\",
+  \"week_count\": 2
+}"
+
+echo
+echo "-- each week is an ordinary reservation: cancel week 2 with its own token --"
+W2_RID="$(echo "$PLAN_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["weeks"][1]["reservation"]["id"])')"
+W2_TOKEN="$(echo "$PLAN_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["weeks"][1]["reservation"]["cancel_token"])')"
+api POST "/points/$WPID/reservations/$W2_RID/cancel" "{\"cancel_token\":\"$W2_TOKEN\"}"
+# Replay still returns all first-created weeks; week 2 now reads "cancelled".
+api POST "/points/$WPID/weekly-plans" "{
+  \"idempotency_key\": \"weekly-demo-1\",
+  \"first_local_date\": \"$FIRST_MON\",
+  \"start_time\": \"09:00\",
+  \"end_time\": \"10:00\",
+  \"week_count\": 3
+}"

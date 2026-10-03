@@ -25,6 +25,11 @@ def _parse_hhmm(value: str, field_name: str) -> time:
     )
 
 
+def parse_wall_time(value: str, field_name: str = "time") -> time:
+    """Public wrapper around the HH:MM parser (used by the weekly-plan API)."""
+    return _parse_hhmm(value, field_name)
+
+
 class WeeklyRuleIn(BaseModel):
     weekday: int
     start_time: str
@@ -241,6 +246,25 @@ class TripCreateIn(BaseModel):
 
     idempotency_key: str = Field(min_length=1, max_length=200)
     stops: list[TripStopIn] = Field(min_length=2, max_length=5)
+
+
+class WeeklyPlanCreateIn(BaseModel):
+    """Weekly recurring visit plan (连周预约) at one recycling point.
+
+    One fixed wall-clock slot (``start_time`` / ``end_time`` in the point's
+    local time; ``end_time <= start_time`` means the visit ends on the next
+    local day) on ``first_local_date`` and then every 7 local days for
+    ``week_count`` (2..4) weeks.  Each week is located to UTC in the point's
+    timezone (DST gap -> first valid instant; repeated hour -> early start,
+    late end) and must satisfy the existing single-reservation rules; either
+    every week books or none do.
+    """
+
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    first_local_date: date
+    start_time: str
+    end_time: str
+    week_count: int = Field(ge=2, le=4)
 
 
 class TripPlanStopIn(BaseModel):
@@ -623,3 +647,38 @@ class TripPlanOut(BaseModel):
     search_to: str
     min_gap_minutes: int
     stops: list[TripPlanStopOut]
+
+
+class WeeklyPlanVisitOut(BaseModel):
+    """One booked week of a weekly plan (连周预约), in week order.
+
+    The reservation is reported as first created (original UTC window, rules
+    version and revision 1) while its status fields reflect the live row —
+    mirroring reservation create-key replay semantics, so the same plan key
+    replay keeps returning the first-created weekly windows even after an
+    individual week is rescheduled or cancelled.
+    """
+
+    week: int
+    local_date: date
+    reservation: ReservationOut
+
+
+class WeeklyPlanOut(BaseModel):
+    """Result of an atomic weekly recurring booking (连周预约).
+
+    ``weeks`` is always ordered by the 1-based week ordinal; each entry
+    carries that week's ordinary reservation number, cancel token and UTC
+    window, so every week can be cancelled / rescheduled / checked in /
+    checked out independently through the existing endpoints.
+    """
+
+    weekly_plan_id: int
+    point_id: int
+    idempotency_key: str
+    first_local_date: date
+    start_time: str
+    end_time: str
+    week_count: int
+    created_at: datetime
+    weeks: list[WeeklyPlanVisitOut]

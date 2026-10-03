@@ -934,5 +934,90 @@ def main() -> None:
     # replays the first record and a wrong token is always refused.
 
 
+def demo_weekly_plan() -> None:
+    """连周预约: one fixed local slot booked for 2..4 consecutive weeks."""
+    # Fresh point, open 08:00-18:00 every day in Asia/Shanghai.
+    status, point = call(
+        "POST",
+        "/points",
+        {"name": "连周演示点", "timezone": "Asia/Shanghai", "capacity": 3},
+    )
+    pid = point["id"]
+    call(
+        "POST",
+        f"/points/{pid}/rules",
+        {
+            "expected_version": 0,
+            "rules": {
+                "weekly": [
+                    {"weekday": wd, "start_time": "08:00", "end_time": "18:00"}
+                    for wd in range(1, 8)
+                ],
+                "closed_dates": [],
+                "makeup": [],
+            },
+        },
+    )
+
+    # Next Monday in the point's local calendar.
+    today = datetime.now(timezone.utc).astimezone().date()
+    first_monday = today + timedelta(days=(7 - today.isoweekday()) % 7 + 1)
+    request = {
+        "idempotency_key": "weekly-demo-1",
+        "first_local_date": first_monday.isoformat(),
+        "start_time": "09:00",   # local wall clock
+        "end_time": "10:00",     # end <= start would mean a next-day end
+        "week_count": 3,         # 2..4 consecutive weeks
+    }
+    status, plan = call("POST", f"/points/{pid}/weekly-plans", request)
+    show(
+        "book local 09:00-10:00 for 3 weeks (201; UTC 01:00-02:00 in Shanghai)",
+        status,
+        plan,
+    )
+    # weeks[] is ordered; each entry is an ordinary reservation with its own
+    # id and cancel_token, so every week can be cancelled/rescheduled/
+    # checked in/checked out independently.
+
+    status, replay = call("POST", f"/points/{pid}/weekly-plans", request)
+    show("same point + same key + same content replays the first plan (200)",
+         status, replay)
+    assert replay["weekly_plan_id"] == plan["weekly_plan_id"]
+
+    changed = {**request, "start_time": "11:00", "end_time": "12:00"}
+    status, conflict = call("POST", f"/points/{pid}/weekly-plans", changed)
+    show("same key with different content (409 idempotency_conflict)",
+         status, conflict)
+
+    # All-or-nothing: 15:00-18:30 exceeds the 120-minute max on every week;
+    # nothing is booked and details.failed_weeks names each failing week.
+    status, failed = call(
+        "POST",
+        f"/points/{pid}/weekly-plans",
+        {
+            "idempotency_key": "weekly-demo-bad",
+            "first_local_date": first_monday.isoformat(),
+            "start_time": "15:00",
+            "end_time": "18:30",
+            "week_count": 2,
+        },
+    )
+    show("one invalid week books nothing (422; failed_weeks listed)",
+         status, failed["error"])
+
+    # Cancel week 2 using its own cancel token.
+    week2 = plan["weeks"][1]["reservation"]
+    status, cancelled = call(
+        "POST",
+        f"/points/{pid}/reservations/{week2['id']}/cancel",
+        {"cancel_token": week2["cancel_token"]},
+    )
+    show("cancel week 2 independently (200)", status, cancelled)
+    status, after = call("POST", f"/points/{pid}/weekly-plans", request)
+    show("replay reflects the current status (week 2 now cancelled)",
+         status, after)
+
+
 if __name__ == "__main__":
     main()
+    demo_weekly_plan()

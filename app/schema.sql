@@ -246,3 +246,48 @@ CREATE TABLE IF NOT EXISTS slot_locks (
 -- future) alongside active reservations; this partial index serves them.
 CREATE INDEX IF NOT EXISTS idx_slot_locks_point_locked
     ON slot_locks (point_id, start_utc) WHERE status = 'locked';
+
+-- Weekly recurring visit plans (连周预约).  A visitor books one fixed wall-clock
+-- slot at one recycling point for 2..4 consecutive weeks, expressed in the
+-- point's local calendar: first week's local date, local start/end wall-clock
+-- times (end <= start means the visit ends on the next local day) and the
+-- number of weeks.  Every weekly window is converted to UTC with the same DST
+-- rules as the calendar engine and must satisfy the existing single-visit
+-- rules; either all weeks are booked in one transaction or none are.
+-- (point_id, idempotency_key) is the client's idempotency scope, mirroring
+-- reservations: the first successful request wins, same-content retries
+-- replay the first-created weekly windows and credentials, and a request that
+-- fails validation rolls its plan-row insert back, so it never consumes the
+-- key.
+CREATE TABLE IF NOT EXISTS weekly_plans (
+    id               BIGSERIAL PRIMARY KEY,
+    point_id         BIGINT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+    idempotency_key  TEXT NOT NULL,
+    first_local_date DATE NOT NULL,           -- local date of week 1
+    start_time       TEXT NOT NULL,           -- local wall clock HH:MM
+    end_time         TEXT NOT NULL,           -- <= start_time => next-day end
+    week_count       INTEGER NOT NULL CHECK (week_count BETWEEN 2 AND 4),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (point_id, idempotency_key)
+);
+
+-- One row per booked week of a weekly plan (week is the 1-based ordinal).  The
+-- located UTC window is stored so a retry can be compared against the resolved
+-- content and the first-creation snapshot can be replayed even after an
+-- individual week's reservation is rescheduled or cancelled.  Each week is an
+-- ordinary reservation with its own number and cancel token.
+CREATE TABLE IF NOT EXISTS weekly_plan_visits (
+    id              BIGSERIAL PRIMARY KEY,
+    plan_id         BIGINT NOT NULL REFERENCES weekly_plans(id) ON DELETE CASCADE,
+    point_id        BIGINT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+    week            INTEGER NOT NULL,         -- 1-based ordinal
+    reservation_id  BIGINT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+    start_utc       TIMESTAMPTZ NOT NULL,
+    end_utc         TIMESTAMPTZ NOT NULL,
+    rules_version   INTEGER NOT NULL,         -- published version validated against
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (plan_id, week)
+);
+
+CREATE INDEX IF NOT EXISTS idx_weekly_plan_visits_reservation
+    ON weekly_plan_visits (reservation_id);
